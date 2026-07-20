@@ -1,114 +1,114 @@
-#!/usr/bin/env python3
 import rclpy
 from rclpy.node import Node
-from std_msgs.msg import Int32MultiArray
+
+# Int32 is used for single numbers (like a single speed or angle).
+# Int32MultiArray is used for lists of numbers (like speeds for 4 different wheels).
+from std_msgs.msg import Int32, Int32MultiArray
+
+# This is the proprietary library provided by the chassis manufacturer to talk to the expansion board.
 from Rosmaster_Lib import Rosmaster
 
-class MotorControlNode(Node):
-    """
-    Subscribes to /motor_ctrl (std_msgs/Int32MultiArray) with data = [m1, m2, m3, m4]
-    and drives the corresponding motors on the Rosmaster board.
 
-    m1-m4 speeds: -100 to 100 (percentage)
-    """
-
+class UnifiedMotorControl(Node):
     def __init__(self):
-        super().__init__('motor_control')
+        # Initialize the ROS 2 node with the name 'motor_control'
+        super().__init__("motor_control_node")
 
-        # ---- initialize an array to hold the offset values for all 4 motors
-        self.encoder_offsets = [0, 0, 0, 0]
-
-        # ---- parameters (overridable via ros2 run/launch) ----
-        self.declare_parameter('serial_port', '/dev/myserial')
-        self.declare_parameter('baud_rate', 115200)
-
-        serial_port = self.get_parameter('serial_port').get_parameter_value().string_value
-        baud_rate = self.get_parameter('baud_rate').get_parameter_value().integer_value
-
-        # ---- connect to the board ----
-        self.bot = Rosmaster(car_type=1, com=serial_port, debug=False)
-        self.bot.create_receive_threading()
-        self.get_logger().info(f'Connected to Rosmaster on {serial_port} @ {baud_rate}')
-
-        # ---- subscription ----
-        self.sub_motor = self.create_subscription(
-            Int32MultiArray, 'motor_ctrl', self.motor_callback, 10)
-
-        self.get_logger().info(
-            'motor_control ready. Publish to /motor_ctrl with data=[m1, m2, m3, m4] '
-            'e.g. ros2 topic pub --once /motor_ctrl std_msgs/msg/Int32MultiArray "{data: [50, 50, 50, 50]}"'
-        )
-
-    def reset_encoders(self):
-        """
-        Call this function whenever you want to 'zero out' your encoder readings.
-        It captures the current hardware counts to use as the new zero-offset.
-        """
+        # ---------------------------------------------------------
+        # 1. HARDWARE INITIALIZATION
+        # ---------------------------------------------------------
         try:
-            # Fetch the raw encoder data from the board
-            e1, e2, e3, e4 = self.bot.get_motor_encoder()
-            
-            # Save these raw values as our new baseline
-            self.encoder_offsets = [e1, e2, e3, e4]
-            self.get_logger().info('Encoder readings successfully reset to 0 (via software offset).')
-        except Exception as e:
-            self.get_logger().error(f"Failed to read encoders for reset: {e}")
+            self.bot = Rosmaster(com="/dev/myserial", delay=0.002, debug=False)
+            self.bot.create_receive_threading()
+            self.get_logger().info("Connected to Rosmaster on /dev/myserial")
 
-    def get_zeroed_encoders(self):
-        """
-        Call this function to get your current encoder positions relative to your last reset.
-        """
-        try:
-            # Read the current raw data
-            e1, e2, e3, e4 = self.bot.get_motor_encoder()
-            
-            # Subtract the saved baseline offsets from the raw data
-            real_e1 = e1 - self.encoder_offsets[0]
-            real_e2 = e2 - self.encoder_offsets[1]
-            real_e3 = e3 - self.encoder_offsets[2]
-            real_e4 = e4 - self.encoder_offsets[3]
-            
-            return [real_e1, real_e2, real_e3, real_e4]
+            # --- NEW: INITIALIZE SERVOS ---
+            # Set servos 1 (steering), 2 (camera vertical), and 3 (camera horizontal) to their center position (90 degrees) on startup.
+            # You can change '90' to whatever default angle your specific hardware requires.
+            self.bot.set_pwm_servo(1, 90)
+            self.bot.set_pwm_servo(2, 15)
+            self.bot.set_pwm_servo(3, 90)
+            self.get_logger().info("Servos 1, 2, and 3 initialized to 90 degrees.")
+
         except Exception as e:
-            self.get_logger().error(f"Failed to read encoders: {e}")
-            return [0, 0, 0, 0]
-    
-    def motor_callback(self, msg: Int32MultiArray):
-        if len(msg.data) != 4:
-            self.get_logger().warn(
-                f'Expected data=[m1, m2, m3, m4], got {list(msg.data)}. Ignoring.')
+            self.get_logger().error(f"Failed to connect to Rosmaster: {e}")
             return
 
-        m1, m2, m3, m4 = msg.data
+        # ---------------------------------------------------------
+        # 2. LINE FOLLOWER SUBSCRIPTIONS
+        # ---------------------------------------------------------
+        # These listen to the custom topics published by your line_follow_node.py.
+        # They expect a single integer (Int32) for steering and speed.
+        self.create_subscription(
+            Int32, "/servo/steering_angle", self.steering_callback, 10
+        )
+        self.create_subscription(Int32, "/motor/speed", self.speed_callback, 10)
 
-        # Clamp speeds to safe ranges (-100 to 100)
-        m1 = max(-100, min(100, m1))
-        m2 = max(-100, min(100, m2))
-        m3 = max(-100, min(100, m3))
-        m4 = max(-100, min(100, m4))
+        # ---------------------------------------------------------
+        # 3. LEGACY / MANUAL CONTROL SUBSCRIPTIONS
+        # ---------------------------------------------------------
+        # These listen to the original topics from the manufacturer.
+        # They expect an array of integers (Int32MultiArray) to control specific servos or all 4 wheels.
+        self.create_subscription(
+            Int32MultiArray, "/servo_ctrl", self.servo_array_callback, 10
+        )
+        self.create_subscription(
+            Int32MultiArray, "/dc_motor_ctrl", self.motor_array_callback, 10
+        )
 
-        self.bot.set_motor(m1, m2, m3, m4)
-        self.get_logger().info(f'set_motor(m1={m1}, m2={m2}, m3={m3}, m4={m4})')
+    # =========================================================
+    # CALLBACK FUNCTIONS
+    # These trigger automatically whenever a message arrives on their respective topics.
+    # =========================================================
 
-    def destroy_node(self):
-        try:
-            # Send a stop command to all motors before shutting down
-            self.bot.set_motor(0, 0, 0, 0)
-            del self.bot
-        except Exception:
-            pass
-        super().destroy_node()
+    def steering_callback(self, msg):
+        """Called when a steering angle is received from the line follower."""
+        angle = msg.data
+        # Sends the angle to PWM servo #1 (usually the front steering rack).
+        self.bot.set_pwm_servo(1, angle)
+
+    def speed_callback(self, msg):
+        """Called when a speed command is received from the line follower."""
+        speed = msg.data
+        # Applies the exact same speed to all four DC motors (Front-Left, Front-Right, Rear-Left, Rear-Right).
+        self.bot.set_motor(speed, speed, speed, speed)
+
+    def servo_array_callback(self, msg):
+        """Called when a manual servo command array is received."""
+        # Ensures the array contains exactly 2 items: [servo_id, angle]
+        if len(msg.data) == 2:
+            servo_id, angle = msg.data
+            self.bot.set_pwm_servo(servo_id, angle)
+
+    def motor_array_callback(self, msg):
+        """Called when a manual motor command array is received."""
+        # Ensures the array contains exactly 4 items: [speed1, speed2, speed3, speed4]
+        if len(msg.data) == 4:
+            s1, s2, s3, s4 = msg.data
+            self.bot.set_motor(s1, s2, s3, s4)
+
 
 def main(args=None):
+    # Start the ROS 2 Python communications
     rclpy.init(args=args)
-    node = MotorControlNode()
+    # Instantiate our custom node class
+    node = UnifiedMotorControl()
+
     try:
+        # Keep the node running and listening for incoming topic messages infinitely
         rclpy.spin(node)
     except KeyboardInterrupt:
-        pass
+        # Gracefully handle the user pressing Ctrl+C in the terminal
+        node.get_logger().info("Shutting down Motor Control Node...")
     finally:
+        # FAILSAFE: Always tell the hardware to stop all 4 motors before the script exits,
+        # otherwise the car will keep driving forward forever.
+        node.bot.set_motor(0, 0, 0, 0)
+        # Destroy the node to free up memory
         node.destroy_node()
+        # Shutdown ROS 2 communications
         rclpy.shutdown()
 
-if __name__ == '__main__':
+
+if __name__ == "__main__":
     main()
