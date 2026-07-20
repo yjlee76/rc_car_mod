@@ -1,6 +1,7 @@
 # RC Car Mod Project
 This is the project repository for a RC car-based autonomous driving course.
-The used hardware includes the following
+The used hardware includes the following:
+
 	1. NVIDIA Jetson Orin Nano or NX
 	2. USB camera
 	3. Slamtec C1 lidar
